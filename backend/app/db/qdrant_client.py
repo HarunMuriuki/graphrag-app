@@ -90,6 +90,36 @@ def search(embedding: list[float], top_k: int) -> list[dict[str, Any]]:
     return out
 
 
+def delete_points_by_doc_id(doc_id: str) -> int:
+    """Delete all Qdrant points belonging to a document. Returns the number
+    of points deleted. Uses a filter scroll + batch delete since Qdrant
+    doesn't support a direct 'delete by payload filter' in one call."""
+    client = get_qdrant()
+    # Collect all point IDs for this doc_id
+    point_ids: list[str] = []
+    next_offset = None
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=settings.qdrant_collection,
+            limit=256,
+            offset=next_offset,
+            scroll_filter=qm.Filter(
+                must=[qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id))]
+            ),
+            with_payload=False,
+        )
+        point_ids.extend(p.id for p in points)
+        if next_offset is None:
+            break
+
+    if point_ids:
+        client.delete(
+            collection_name=settings.qdrant_collection,
+            points_selector=qm.PointIdsList(points=point_ids),
+        )
+    return len(point_ids)
+
+
 def list_sources() -> list[dict[str, Any]]:
     """Scroll the whole collection and aggregate distinct source documents.
     Fine for a demo-scale local app; for large corpora you'd track this in
