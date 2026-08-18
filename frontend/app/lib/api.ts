@@ -23,6 +23,16 @@ export async function listDocuments(): Promise<DocumentSummary[]> {
   return res.json();
 }
 
+export async function deleteDocument(docId: string): Promise<{
+  doc_id: string;
+  qdrant_chunks_deleted: number;
+  neo4j_chunks_deleted: number;
+}> {
+  const res = await fetch(`${API_BASE}/documents/${docId}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Failed to delete document: ${res.status}`);
+  return res.json();
+}
+
 export async function getGraphOverview(limit = 150): Promise<GraphPayload> {
   const res = await fetch(`${API_BASE}/graph/overview?limit=${limit}`);
   if (!res.ok) throw new Error(`Failed to fetch graph overview: ${res.status}`);

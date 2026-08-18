@@ -227,6 +227,33 @@ def get_graph_sample(limit: int = 150) -> dict[str, list[dict[str, Any]]]:
         return {"nodes": list(nodes.values()), "edges": edges}
 
 
+def delete_document_graph(doc_id: str) -> int:
+    """Delete all Chunk nodes (and their MENTIONS edges) for a given doc_id,
+    then clean up any Entity nodes that are now orphaned (no remaining
+    MENTIONS edges). Returns the number of chunks deleted."""
+    with get_driver().session() as session:
+        # Delete all Chunk nodes for this doc_id (MENTIONS edges are
+        # deleted automatically since they are attached to the Chunk).
+        result = session.run(
+            "MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c RETURN count(c) AS deleted",
+            doc_id=doc_id,
+        )
+        chunk_count = result.single()["deleted"]
+
+        # Clean up orphaned Entity nodes — entities that no longer have
+        # any MENTIONS edges pointing to them. We leave RELATED edges
+        # between surviving entities intact.
+        session.run(
+            """
+            MATCH (e:Entity)
+            WHERE NOT (e)<-[:MENTIONS]-(:Chunk)
+            DETACH DELETE e
+            """
+        )
+
+        return chunk_count
+
+
 def document_stats() -> list[dict[str, Any]]:
     with get_driver().session() as session:
         result = session.run(

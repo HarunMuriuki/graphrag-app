@@ -38,7 +38,7 @@ export default function Home() {
           </p>
         </div>
         <UploadPanel onIngested={() => setRefreshKey((k) => k + 1)} />
-        <DocumentList refreshKey={refreshKey} />
+        <DocumentList refreshKey={refreshKey} onDeleted={() => setRefreshKey((k) => k + 1)} />
       </aside>
 
       <ChatWindow
