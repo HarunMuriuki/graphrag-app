@@ -1,26 +1,25 @@
 """
 End-to-end ingestion pipeline, run as a FastAPI BackgroundTask:
 
-    load file -> extract text -> chunk -> for each chunk (in parallel):
-        embed (Ollama/nomic-embed-text) -> upsert into Qdrant
-        extract entities/relations (Ollama/mistral) -> write into Neo4j
+    load file -> extract text -> chunk ->
+        PHASE 1: embed ALL chunks -> upsert into Qdrant  (embedding model loaded)
+        PHASE 2: extract entities/relations for ALL chunks -> write into Neo4j  (LLM loaded)
 
 Every chunk gets a stable UUID (derived from doc_id + chunk_index) that is
 shared between Qdrant (point id) and Neo4j (Chunk.id), which is what lets
 retrieval hop from "these chunks matched the vector search" to "these
 entities/relationships are attached to those chunks" in the graph.
 
-PARALLELISM:
-    Chunks are processed concurrently up to `settings.ingestion_concurrency`
-    (default 4). This bounds how many Ollama requests are in-flight at once
-    so we don't overwhelm GPU memory. The semaphore is acquired BEFORE the
-    Ollama calls (the slow part) and released AFTER the DB writes (the fast
-    part), keeping each chunk's work atomic.
+TWO-PHASE PROCESSING:
+    Ollama swaps models between embedding (nomic-embed-text) and generation
+    (phi4-mini). Each swap takes ~30-60s of model loading time. By batching
+    all embeddings first, then all entity extractions, we force only ONE
+    model swap instead of one per chunk. For a 143-chunk document, that
+    saves ~143 * 30s = ~70 minutes of wasted model loading time.
 
-    Progress tracking uses an atomic counter (completed_count + Lock) instead
-    of sequential index, because chunks now finish out of order.
-
-    To disable parallelism, set INGESTION_CONCURRENCY=1 in your .env.
+    Within each phase, chunks are processed concurrently (bounded by
+    ingestion_concurrency semaphore). Progress is tracked as a single
+    counter that advances through both phases.
 """
 import asyncio
 import logging
@@ -44,31 +43,33 @@ async def run_ingestion(job_id: str, file_path: str, original_filename: str) -> 
         update_job(job_id, status="processing")
 
         text = loaders.extract_text(file_path)
-        chunks = chunk_text(text)
+        # Pass Ollama embed function for semantic chunking strategy;
+        # ignored by recursive/sentence strategies
+        chunks = await chunk_text(text, embed_fn=ollama_client.embed)
         update_job(job_id, total_chunks=len(chunks))
 
         if not chunks:
             update_job(job_id, status="error", error="No extractable text found in file.")
             return
 
-        # --- Parallel chunk processing ---
-        # The semaphore caps how many chunks are processed at the same time.
-        # This prevents Ollama from running out of GPU memory when ingesting
-        # large documents with many chunks. Increase if your Ollama server
-        # has enough VRAM (e.g. 8+ GB), decrease if you see OOM errors.
         semaphore = asyncio.Semaphore(settings.ingestion_concurrency)
         completed_count = 0
         progress_lock = asyncio.Lock()
 
-        async def _process_chunk(index: int, chunk: str) -> None:
+        # ------------------------------------------------------------------
+        # PHASE 1: Embedding — all chunks in parallel while the embedding
+        # model (nomic-embed-text) is loaded in Ollama. Each chunk gets
+        # embedded and upserted into Qdrant. We store the chunk_id for
+        # Phase 2.
+        # ------------------------------------------------------------------
+        logger.info("Phase 1/2: embedding %d chunks", len(chunks))
+        update_job(job_id, phase="embed")
+
+        chunk_ids: list[str] = [qdrant_client.chunk_point_id(doc_id, i) for i in range(len(chunks))]
+
+        async def _embed_one(index: int, chunk: str) -> None:
             nonlocal completed_count
-
-            # Acquire semaphore BEFORE any Ollama call — this is the
-            # bottleneck that needs rate limiting, not the DB writes.
             async with semaphore:
-                chunk_id = qdrant_client.chunk_point_id(doc_id, index)
-
-                # Embedding is fast (~100-300ms) but still goes over HTTP.
                 embedding = await ollama_client.embed(chunk)
                 qdrant_client.upsert_chunk(
                     doc_id=doc_id,
@@ -77,32 +78,45 @@ async def run_ingestion(job_id: str, file_path: str, original_filename: str) -> 
                     source=original_filename,
                     embedding=embedding,
                 )
+                async with progress_lock:
+                    completed_count += 1
+                    update_job(job_id, processed_chunks=completed_count)
 
-                # Entity extraction is the heaviest single operation (~1-5s).
-                # This is where most of the ingestion time is spent, and
-                # therefore where parallelism gives the biggest speedup.
+        await asyncio.gather(*(_embed_one(i, c) for i, c in enumerate(chunks)))
+        logger.info("Phase 1 complete: all %d chunks embedded", len(chunks))
+
+        # ------------------------------------------------------------------
+        # PHASE 2: Entity extraction — all chunks in parallel while the LLM
+        # (phi4-mini) is loaded in Ollama. Ollama will have swapped from
+        # the embedding model to the LLM once here, instead of 143 times.
+        # Uses a separate (lower) concurrency because LLM generation is
+        # CPU-bound — running too many in parallel causes contention and
+        # timeouts.
+        # ------------------------------------------------------------------
+        logger.info("Phase 2/2: extracting entities from %d chunks (concurrency=%d)",
+                     len(chunks), settings.extraction_concurrency)
+        update_job(job_id, phase="extract")
+        extract_semaphore = asyncio.Semaphore(settings.extraction_concurrency)
+
+        async def _extract_one(index: int, chunk: str) -> None:
+            nonlocal completed_count
+            async with extract_semaphore:
                 graph = await extract_entities_relations(chunk)
                 neo4j_client.write_chunk_graph(
                     doc_id=doc_id,
-                    chunk_id=chunk_id,
+                    chunk_id=chunk_ids[index],
                     chunk_index=index,
                     source=original_filename,
                     text=chunk,
                     entities=graph["entities"],
                     relations=graph["relations"],
                 )
-
-                # Update progress atomically. Chunks finish out of order,
-                # so we can't use the loop index — we count completions.
                 async with progress_lock:
                     completed_count += 1
                     update_job(job_id, processed_chunks=completed_count)
 
-        # Launch all chunks concurrently (semaphore bounds actual parallelism).
-        # asyncio.gather preserves the "wait for all to finish" semantics.
-        await asyncio.gather(
-            *(_process_chunk(i, chunk) for i, chunk in enumerate(chunks))
-        )
+        await asyncio.gather(*(_extract_one(i, c) for i, c in enumerate(chunks)))
+        logger.info("Phase 2 complete: all %d chunks extracted", len(chunks))
 
         update_job(job_id, status="done")
     except Exception as exc:  # noqa: BLE001 - report to the job, don't crash the worker

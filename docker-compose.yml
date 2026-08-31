@@ -3,6 +3,13 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: graphrag-ollama
+    environment:
+      # Number of concurrent inference slots. Increase if your GPU has
+      # enough VRAM (each slot ~2-4 GB depending on model size).
+      # Set to 1 if you see OOM errors.
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-4}
+      # Allow LLM and embedding model to stay loaded simultaneously.
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
     volumes:
       - ollama_data:/root/.ollama
     ports:
@@ -103,6 +110,13 @@ services:
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-graphrag_password}
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
+      CHUNKING_STRATEGY: ${CHUNKING_STRATEGY:-recursive}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
+      CHUNK_SENTENCES_PER_CHUNK: ${CHUNK_SENTENCES_PER_CHUNK:-8}
+      CHUNK_SENTENCE_OVERLAP: ${CHUNK_SENTENCE_OVERLAP:-1}
+      CHUNK_SEMANTIC_MAX_SENTENCES: ${CHUNK_SEMANTIC_MAX_SENTENCES:-20}
+      CHUNK_SEMANTIC_THRESHOLD: ${CHUNK_SEMANTIC_THRESHOLD:-80}
     volumes:
       - uploads_data:/app/data/uploads
     ports:
