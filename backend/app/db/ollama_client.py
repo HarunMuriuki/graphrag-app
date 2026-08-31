@@ -19,7 +19,7 @@ class OllamaClient:
     def __init__(self, base_url: str = settings.ollama_base_url):
         self.base_url = base_url.rstrip("/")
 
-    @retry(wait=wait_exponential(multiplier=1, min=1, max=10), stop=stop_after_attempt(5))
+    @retry(wait=wait_exponential(multiplier=1, min=1, max=10), stop=stop_after_attempt(8))
     async def embed(self, text: str, model: Optional[str] = None) -> list[float]:
         model = model or settings.embedding_model
         async with httpx.AsyncClient(timeout=60.0) as client:

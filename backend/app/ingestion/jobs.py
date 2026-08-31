@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 JobStatus = Literal["pending", "processing", "done", "error"]
+JobPhase = Literal["embed", "extract"]
 
 
 @dataclass
@@ -20,6 +21,7 @@ class IngestJob:
     id: str
     filename: str
     status: JobStatus = "pending"
+    phase: JobPhase | None = None
     total_chunks: int = 0
     processed_chunks: int = 0
     error: str | None = None
