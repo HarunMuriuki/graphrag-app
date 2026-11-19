@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     graph_expand_hops: int = 1      # how many hops to expand from seed entities
     graph_max_nodes: int = 40       # cap returned subgraph size for the viz panel
 
+    # --- Hybrid (BM25 + dense) retrieval ---
+    # Dense embeddings capture semantic meaning; BM25 sparse search captures exact
+    # keyword matches (field names, codes, numbers). We fuse both with Qdrant's
+    # native Reciprocal Rank Fusion (RRF, k=60 fixed server-side). These knobs let
+    # you tune without code changes.
+    use_hybrid: bool = True          # toggle hybrid on/off for A/B testing
+    bm25_sparse_limit: int = 20      # candidate pool fetched from the sparse/BM25 path before fusion
+    hybrid_top_k: int = 13           # final fused result count fed to the LLM
+
     # --- CORS ---
     cors_allow_origins: str = "*"
 

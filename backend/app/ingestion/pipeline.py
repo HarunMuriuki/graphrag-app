@@ -33,6 +33,7 @@ from app.ingestion import loaders
 from app.ingestion.chunker import chunk_text
 from app.ingestion.extractor import extract_entities_relations
 from app.ingestion.jobs import update_job
+from app.ingestion.sparse import bm25_term_frequencies, tokenize
 
 logger = logging.getLogger("graphrag.ingestion")
 
@@ -71,12 +72,17 @@ async def run_ingestion(job_id: str, file_path: str, original_filename: str) -> 
             nonlocal completed_count
             async with semaphore:
                 embedding = await ollama_client.embed(chunk)
+                # Build the BM25 sparse vector for this chunk's text (pure token
+                # math, no LLM). This is what lets hybrid retrieval do keyword
+                # matching on exact field names / codes later.
+                sparse = bm25_term_frequencies(tokenize(chunk))
                 qdrant_client.upsert_chunk(
                     doc_id=doc_id,
                     chunk_index=index,
                     text=chunk,
                     source=original_filename,
                     embedding=embedding,
+                    sparse=sparse,
                 )
                 async with progress_lock:
                     completed_count += 1

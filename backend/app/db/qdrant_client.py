@@ -1,6 +1,17 @@
 """
 Wrapper around the Qdrant client: collection bootstrap, upsert of chunk
-embeddings, and vector similarity search.
+embeddings, and hybrid retrieval (dense vector + BM25 sparse + RRF).
+
+HYBRID SEARCH
+=============
+We store TWO vector fields per chunk in the Qdrant collection:
+  * "dense"  -- the nomic-embed-text embedding (semantic similarity).
+  * "sparse" -- a BM25 term-frequency sparse vector (exact keyword matching
+                on field names, codes, numbers).
+At query time we issue a `QueryRequest` with two prefetches (dense + sparse)
+fused by Reciprocal Rank Fusion (`Fusion.RRF`). This lets exact-match and
+semantic matches reinforce each other -- the key fix for Finacle banking
+scripts full of precise identifiers that dense embeddings smooth over.
 """
 import uuid
 from typing import Any
@@ -21,14 +32,45 @@ def get_qdrant() -> QdrantClient:
 
 
 def ensure_collection() -> None:
+    """Create the collection with BOTH dense and sparse vector fields if missing.
+
+    SCHEMA MIGRATION / RE-INGESTION
+    ================================
+    Hybrid search requires the "sparse" vector field. If an existing collection
+    was created before this change (single dense vector only), it cannot serve
+    hybrid results. We detect that and DROP + recreate the collection so the
+    sparse field exists -- which means any previously-ingested documents must be
+    re-uploaded (their points are discarded with the old collection).
+    """
     client = get_qdrant()
+    existing = [c.name for c in client.get_collections().collections]
+
+    if settings.qdrant_collection in existing:
+        info = client.get_collection(settings.qdrant_collection)
+        has_sparse = "sparse" in (info.config.params.sparse_vectors or {})
+        if not has_sparse:
+            # Old single-vector schema: drop it so we can rebuild with sparse.
+            import logging
+
+            logging.getLogger("graphrag.startup").warning(
+                "Collection '%s' lacks the sparse vector field required for hybrid "
+                "search. Recreating it -- please re-ingest your documents.",
+                settings.qdrant_collection,
+            )
+            client.delete_collection(settings.qdrant_collection)
+
     existing = [c.name for c in client.get_collections().collections]
     if settings.qdrant_collection not in existing:
         client.create_collection(
             collection_name=settings.qdrant_collection,
-            vectors_config=qm.VectorParams(
-                size=settings.embedding_dim, distance=qm.Distance.COSINE
-            ),
+            vectors_config={
+                "dense": qm.VectorParams(
+                    size=settings.embedding_dim, distance=qm.Distance.COSINE
+                ),
+            },
+            sparse_vectors_config={
+                "sparse": qm.SparseVectorParams(index=qm.SparseIndexParams()),
+            },
         )
 
 
@@ -44,15 +86,35 @@ def upsert_chunk(
     text: str,
     source: str,
     embedding: list[float],
+    sparse: dict[int, float] | None = None,
 ) -> str:
+    """Store a chunk's dense + sparse vectors.
+
+    Parameters
+    ----------
+    sparse : dict[int, float] | None
+        The BM25 sparse vector ({token_id: weight}) computed by
+        app.ingestion.sparse for this chunk's text. If None (e.g. legacy call),
+        only the dense vector is stored -- hybrid search will skip such points.
+    """
     client = get_qdrant()
     point_id = chunk_point_id(doc_id, chunk_index)
+
+    # Build the per-named-vector dict Qdrant expects for multi-vector points.
+    vectors: dict[str, Any] = {"dense": embedding}
+    if sparse:
+        # A SparseVector uses parallel `indices` / `values` arrays.
+        indices = sorted(sparse.keys())
+        vectors["sparse"] = qm.SparseVector(
+            indices=indices, values=[sparse[i] for i in indices]
+        )
+
     client.upsert(
         collection_name=settings.qdrant_collection,
         points=[
             qm.PointStruct(
                 id=point_id,
-                vector=embedding,
+                vector=vectors,
                 payload={
                     "doc_id": doc_id,
                     "chunk_id": point_id,
@@ -67,27 +129,112 @@ def upsert_chunk(
 
 
 def search(embedding: list[float], top_k: int) -> list[dict[str, Any]]:
+    """Pure dense (semantic) vector search -- kept for reference / A-B testing."""
     client = get_qdrant()
     results = client.search(
         collection_name=settings.qdrant_collection,
-        query_vector=embedding,
+        query_vector=("dense", embedding),
         limit=top_k,
         with_payload=True,
     )
-    out = []
-    for r in results:
-        payload = r.payload or {}
-        out.append(
-            {
-                "score": r.score,
-                "chunk_id": payload.get("chunk_id"),
-                "doc_id": payload.get("doc_id"),
-                "chunk_index": payload.get("chunk_index"),
-                "text": payload.get("text"),
-                "source": payload.get("source"),
-            }
+    return [_row(r) for r in results]
+
+
+def _row(r) -> dict[str, Any]:
+    """Normalize a Qdrant hit into our stable chunk dict shape."""
+    payload = r.payload or {}
+    return {
+        "score": r.score,
+        "chunk_id": payload.get("chunk_id"),
+        "doc_id": payload.get("doc_id"),
+        "chunk_index": payload.get("chunk_index"),
+        "text": payload.get("text"),
+        "source": payload.get("source"),
+    }
+
+
+def sparse_search(sparse_query: dict[int, float], top_k: int) -> list[dict[str, Any]]:
+    """Pure BM25 (sparse) keyword search over the "sparse" vector field."""
+    client = get_qdrant()
+    queried = qm.QueryRequest(
+        prefetch=[
+            qm.Prefetch(
+                query=qm.SparseVector(
+                    indices=sorted(sparse_query.keys()),
+                    values=[sparse_query[i] for i in sorted(sparse_query.keys())],
+                ),
+                using="sparse",
+                limit=top_k,
+            )
+        ],
+        query=qm.Fusion.RRF,
+        limit=top_k,
+        with_payload=True,
+    )
+    results = client.query_points(
+        collection_name=settings.qdrant_collection, query=queried
+    ).points
+    return [_row(r) for r in results]
+
+
+def hybrid_search(
+    embedding: list[float],
+    sparse_query: dict[int, float],
+    top_k: int | None = None,
+    dense_limit: int | None = None,
+    sparse_limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Hybrid dense + BM25 search fused with Reciprocal Rank Fusion (RRF).
+
+    Runs two candidate retrievals in a single QueryRequest:
+      1. "dense"  prefetch using the named dense vector.
+      2. "sparse" prefetch using the named BM25 sparse vector.
+    Then fuses them with Qdrant's native Fusion.RRF. A point that appears in
+    both lists gets a much higher fused score than one that appears in only a
+    single list -- which is exactly the reinforcement we want between semantic
+    and exact matches.
+
+    Arguments
+    ---------
+    embedding      : dense query embedding from Ollama.
+    sparse_query   : {token_id: weight} from app.ingestion.sparse.build_sparse_query.
+    top_k          : final fused count (default settings.hybrid_top_k).
+    dense_limit    : candidate count from the dense path (default settings.vector_top_k).
+    sparse_limit   : candidate count from the sparse path (default settings.bm25_sparse_limit).
+    """
+    top_k = top_k or settings.hybrid_top_k
+    dense_limit = dense_limit or settings.vector_top_k
+    sparse_limit = sparse_limit or settings.bm25_sparse_limit
+
+    client = get_qdrant()
+
+    prefetches = [
+        qm.Prefetch(query=embedding, using="dense", limit=dense_limit),
+    ]
+    if sparse_query:
+        # Only add the BM25 path if we actually have query terms.
+        prefetches.append(
+            qm.Prefetch(
+                query=qm.SparseVector(
+                    indices=sorted(sparse_query.keys()),
+                    values=[sparse_query[i] for i in sorted(sparse_query.keys())],
+                ),
+                using="sparse",
+                limit=sparse_limit,
+            )
         )
-    return out
+
+    queried = qm.QueryRequest(
+        prefetch=prefetches,
+        query=qm.Fusion.RRF,
+        limit=top_k,
+        with_payload=True,
+    )
+
+    results = client.query_points(
+        collection_name=settings.qdrant_collection, query=queried
+    ).points
+    return [_row(r) for r in results]
 
 
 def delete_points_by_doc_id(doc_id: str) -> int:
